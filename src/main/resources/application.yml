@@ -1,0 +1,119 @@
+spring:
+  application:
+    name: payment-service
+  profiles:
+    default: dev
+  datasource:
+    url: jdbc:postgresql://localhost:5432/paymentdb
+    username: postgres
+    password: Welcome@1234
+    driver-class-name: org.postgresql.Driver
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+    consumer:
+      group-id: payment-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
+
+payment:
+  default-currency: INR
+  seed-reference-data: false
+  topics:
+    request: payment.request
+    retry1: payment.retry.1
+    retry2: payment.retry.2
+    retry3: payment.retry.3
+    pending: payment.pending
+    manual: payment.manual-intervention
+  processor:
+    poll-interval-ms: 5000
+    priority: NEW,RETRY_1,RETRY_2,RETRY_3
+  queue-dispatch:
+    poll-interval-ms: 5000
+  retry:
+    delays: PT15M,PT30M,PT2H
+    max-retries: 3
+  pending:
+    # Wait 15 minutes after a PENDING/ambiguous bank result before the next TransactionInquiry.
+    inquiry-delay: PT15M
+    max-inquiries: 12
+  otp:
+    expiry: PT15M
+  txn-categories:
+    "1024": SALARY_PAYMENT
+    "1025": VENDOR_PAYMENT
+    "1026": REIMBURSEMENT
+    "1027": ADVANCE
+    "1028": LOAN
+
+crypto:
+  # Local-only key for OTP worklist encryption. Account numbers are not encrypted in dev mode.
+  field-key: "ddNvcBraftG8RcR796TPg2qqIveRDaHAHTcoe7zT/8Q="
+  our-private-key: classpath:certs/dev/dummy-our-private-key.pem
+  our-certificate: classpath:certs/dev/dummy-our-certificate.pem
+  icici-public-certificate: classpath:certs/dev/dummy-bank-public-cert.pem
+
+icici:
+  client: dummy
+  credentials:
+    aggr-id: LOCAL-DUMMY-AGGR
+    aggr-name: LOCAL-DUMMY
+    corp-id: LOCAL-DUMMY-CORP
+    user-id: LOCAL-DUMMY-USER
+    urn: LOCAL-DUMMY-URN
+  http:
+    otp-path: /api/Corporate/CIB/v1/TransactionOTP
+    txn-path: /api/Corporate/CIB/v1/Create
+    inquiry-path: /api/Corporate/CIB/v1/TransactionInquiry
+    account-statement-path: /api/Corporate/CIB/v1/AccountStatement
+    balance-inquiry-path: /api/Corporate/CIB/v1/BalanceInquiry
+    timeout: PT30S
+  dummy:
+    default-scenario: SUCCESS
+    scenario-by-ben-acct-id:
+      "901": HOST_DOWN_ONCE
+      "902": HOST_DOWN
+      "903": INSUFFICIENT
+      "904": TIMEOUT
+      "905": TIMEOUT_NOT_PROCESSED
+      "906": PENDING
+      "907": BENE_TIMEOUT
+      "908": CLOSED_ACCOUNT
+      "909": INVALID_IFSC
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+
+worklist:
+  service:
+    base-url: ${WORKLIST_SERVICE_URL:http://localhost:9090}
+    task-create-path: /api/v1/worklist/tasks

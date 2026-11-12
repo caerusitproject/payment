@@ -1,0 +1,25 @@
+# Production deployment scaffold. Live payments remain blocked until account encryption,
+# security controls, bank UAT certification, and operational readiness are completed.
+payment:
+  kafka:
+    replication-factor: 3
+
+icici:
+  client: http
+  credentials:
+    aggr-id: ${ICICI_AGGR_ID}
+    aggr-name: ${ICICI_AGGR_NAME}
+    corp-id: ${ICICI_CORP_ID}
+    user-id: ${ICICI_USER_ID}
+    urn: ${ICICI_URN}
+  http:
+    # ICICI workbook indicates a bank-assigned production port; confirm exact URL with ICICI.
+    base-url: ${ICICI_BASE_URL:https://apibankingone.icicibank.com}
+    api-key: ${ICICI_API_KEY}
+    forwarded-for: ${ICICI_FORWARDED_FOR}
+
+crypto:
+  field-key: ${FIELD_ENCRYPTION_KEY}
+  our-private-key: ${CRYPTO_OUR_PRIVATE_KEY}
+  our-certificate: ${CRYPTO_OUR_CERTIFICATE}
+  icici-public-certificate: ${CRYPTO_ICICI_PUBLIC_CERTIFICATE}

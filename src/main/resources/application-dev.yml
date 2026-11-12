@@ -1,0 +1,15 @@
+# Local-only profile. Retry timings and OTP expiry are accelerated; pending inquiry remains 15 minutes.
+payment:
+  processor:
+    poll-interval-ms: 1000
+  retry:
+    delays: PT10S,PT20S,PT30S
+  pending:
+    # Keep the requested 15-minute inquiry interval in local development as well.
+    inquiry-delay: PT15M
+  otp:
+    expiry: PT5M
+  seed-reference-data: true
+
+icici:
+  client: dummy

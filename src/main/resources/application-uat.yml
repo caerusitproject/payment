@@ -1,0 +1,7 @@
+# UAT is intentionally kept in simulation mode until ICICI-issued UAT certificates,
+# credentials, headers, and the final packet contract have been installed and verified.
+# Setting a sandbox URL does not switch DummyIciciClient to the HTTP bank client.
+icici:
+  client: dummy
+  http:
+    base-url: https://apibankingonesandbox.icicibank.com
