@@ -25,11 +25,16 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api/payments")
+@RequestMapping({"/api/payments", "/api/v1/payments"})
 @RequiredArgsConstructor
 public class PaymentController {
 
     public record Accepted(String reqRefName, Long reqRefId, String message) {
+    }
+
+    public record WorklistOtpRequest(@jakarta.validation.constraints.NotBlank
+                                     @jakarta.validation.constraints.Pattern(regexp = "\\d{4,10}")
+                                     String otp) {
     }
 
     public record TxnView(String uniqueId, int attemptNum, String transactionType, TxnStatus txnStatus, String response,
@@ -195,7 +200,7 @@ public class PaymentController {
      * <p>
      * Processing flow:
      * 1. Receive the payment request ID and OTP details.
-     * 2. Acquire the shared PostgreSQL payment execution lock.
+     * 2. Acquire the shared SQL Server payment execution lock.
      * 3. Invoke PaymentWorkflowService.processOtp().
      * 4. Validate the payment request and transaction reference.
      * 5. Pass the OTP to the common payment submission workflow.
@@ -222,12 +227,32 @@ public class PaymentController {
      * is performed by PaymentWorkflowService.submit() after validation
      * and the atomic transaction claim.
      */
+    /**
+     * Accounts UI submits OTP using the external Worklist task ID.
+     * Payment Service validates the task/payment association, updates Worklist status
+     * to COMPLETED through its REST API, and invokes the existing ICICI submit workflow.
+     */
+    @PostMapping("/worklist-tasks/{taskId}/otp")
+    public ResponseEntity<String> submitWorklistOtp(
+            @PathVariable Long taskId,
+            @Valid @RequestBody WorklistOtpRequest request) {
+
+        boolean acquired = executionLock.executeIfAcquired(
+                () -> workflow.processOtpByWorklistTaskId(taskId, request.otp())
+        );
+        if (!acquired) {
+            throw new PaymentExecutionLockException(
+                    "Payment processing is busy; retry the OTP submission shortly");
+        }
+        return ResponseEntity.ok("OTP accepted for payment processing");
+    }
+
     @PostMapping("/{paymentRequestId}/otp")
     public ResponseEntity<String> submitOtp(
             @PathVariable Long paymentRequestId,
             @Valid @RequestBody OtpSubmitRequest request) {
 
-        // Acquire the same PostgreSQL execution lock used by the scheduler
+        // Acquire the same SQL Server execution lock used by the scheduler
         // and retry consumer to prevent concurrent payment execution.
         boolean acquired = executionLock.executeIfAcquired(
                 () -> workflow.processOtp(paymentRequestId, request)

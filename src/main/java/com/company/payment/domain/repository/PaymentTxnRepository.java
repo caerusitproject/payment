@@ -14,6 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 public interface PaymentTxnRepository extends JpaRepository<PaymentTxn, Long> {
     Optional<PaymentTxn> findByUniqueId(String uniqueId);
+    Optional<PaymentTxn> findByWklTaskId(Long wklTaskId);
     List<PaymentTxn> findByPymntReqIdOrderByAttemptNumAsc(Long pymntReqId);
     Optional<PaymentTxn> findFirstByPymntReqIdOrderByPymntTxnIdDesc(Long pymntReqId);
 

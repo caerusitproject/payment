@@ -7,6 +7,7 @@ CREATE TABLE c3_payer (
     payer_name          NVARCHAR(150) NULL,
     acc_num_encrypted   VARBINARY(MAX) NULL,
     acc_num_masked      VARCHAR(30) NULL,
+    acc_num_plain       VARCHAR(18) NULL,
     ifsc_code           VARCHAR(11) NULL,
     currency            CHAR(3) NOT NULL,
     adapter_prvdr       NVARCHAR(150) NOT NULL,
@@ -52,8 +53,9 @@ CREATE TABLE c3_benef_snapshot (
     beni_snap_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
     ben_ref_id          BIGINT NOT NULL,
     ben_acct_hol_name   NVARCHAR(150) NOT NULL,
-    ben_acc_encrypted   VARBINARY(MAX) NOT NULL,
+    ben_acc_encrypted   VARBINARY(MAX) NULL,
     ben_acc_masked      VARCHAR(30) NOT NULL,
+    ben_acc_plain       VARCHAR(18) NULL,
     ifsc_code           VARCHAR(11) NOT NULL,
     bank_name           NVARCHAR(150) NULL,
     txn_categ_cdid      VARCHAR(20) NULL,
@@ -82,6 +84,9 @@ CREATE TABLE c3_pymnt_txn (
     failure_message     VARCHAR(1000) NULL,
     initiated_ts        DATETIME2(3) NOT NULL,
     updated_ts          DATETIME2(3) NULL,
+    wkl_task_id         BIGINT NULL,
+    wkl_task_created_ts DATETIME2(3) NULL,
+    otp_task_expires_ts DATETIME2(3) NULL,
     CONSTRAINT uk_pymnt_txn_uid UNIQUE (unique_id)
 );
 
@@ -97,8 +102,8 @@ CREATE TABLE c3_bank_api_interaction (
 );
 CREATE INDEX ix_bank_api_uid ON c3_bank_api_interaction (unique_id, api_operation);
 
--- Stand-in for the external worklist module (OTP entry + manual intervention items).
-CREATE TABLE c3_worklist_item (
+-- Legacy local manual-intervention fallback only. OTP tasks are owned by the external Worklist Service.
+CREATE TABLE c3_pymnt_worklist_item (
     id                  BIGINT IDENTITY(1,1) PRIMARY KEY,
     item_type           VARCHAR(30) NOT NULL,
     pymnt_req_id        BIGINT NOT NULL,
@@ -113,3 +118,7 @@ CREATE TABLE c3_worklist_item (
     expires_ts          DATETIME2(3) NULL,
     completed_ts        DATETIME2(3) NULL
 );
+
+CREATE UNIQUE INDEX ux_c3_pymnt_txn_wkl_task_id
+    ON c3_pymnt_txn(wkl_task_id)
+    WHERE wkl_task_id IS NOT NULL;

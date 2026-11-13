@@ -12,7 +12,7 @@ import lombok.*;
  * Backing store of the stand-in worklist module; replace {@code WorklistGateway} to use a real one.
  */
 @Entity
-@Table(name = "c3_worklist_item")
+@Table(name = "c3_pymnt_worklist_item")
 @Getter @Setter @Builder @NoArgsConstructor @AllArgsConstructor
 @ToString(exclude = "otpEncrypted")
 public class WorklistItem {

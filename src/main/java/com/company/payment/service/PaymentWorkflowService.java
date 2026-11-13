@@ -19,6 +19,10 @@ import com.company.payment.exception.PaymentTransactionNotFoundException;
 import com.company.payment.exception.InvalidOtpException;
 import com.company.payment.messaging.QueueEventPublisher;
 import com.company.payment.worklist.*;
+import com.company.payment.gateway.worklist.dto.WorklistTaskCreateRequest;
+import com.company.payment.gateway.worklist.dto.WorklistTaskResponse;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
@@ -28,6 +32,7 @@ import java.util.regex.Pattern;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
 
 /**
  * Orchestrates the complete lifecycle of a payment request.
@@ -78,10 +83,34 @@ public class PaymentWorkflowService {
     private final BeneficiaryAccountProvider beneficiaries;
     private final PaymentModeResolver modeResolver;
     private final BankApiService bank;
-    private final WorklistGateway worklist;
+    // External Worklist REST integration for OTP tasks.
+    private final com.company.payment.gateway.worklist.WorklistGateway worklistGateway;
+
+    // Retained only for the existing local manual-intervention fallback until its
+    // external Worklist task definition/contract is supplied.
+    private final com.company.payment.worklist.WorklistGateway manualWorklist;
+
     private final RetryPolicy retryPolicy;
     private final PaymentProperties props;
     private final QueueEventPublisher events;
+
+    @Value("${worklist.service.task-code:PAYMENT_OTP_AUTHORIZATION}")
+    private String worklistTaskCode;
+
+    @Value("${worklist.service.task-name:Authorize Payment Transaction}")
+    private String worklistTaskName;
+
+    @Value("${worklist.service.ref-entity-name:BENEFICIARY}")
+    private String worklistRefEntityName;
+
+    @Value("${worklist.service.linked-instance-entity-name:ONBOARDING}")
+    private String linkedInstanceEntityName;
+
+    @Value("${worklist.service.linked-instance-entity-id:1001}")
+    private Long linkedInstanceEntityId;
+
+    @Value("${worklist.service.assignee-role-code:ACCOUNTS}")
+    private String worklistAssigneeRoleCode;
 
     // -------------------------------------------------------------------------
     // 1. SCHEDULER ENTRY POINT
@@ -616,25 +645,36 @@ public class PaymentWorkflowService {
         //
         // Only one payment is allowed to wait for OTP at a time
         // according to the payment execution workflow.
-        worklist.createOtpItem(new OtpWorkItem(
-                req.getPymntReqId(),
-                txn.getPymntTxnId(),
-                txn.getUniqueId(),
+        LocalDateTime taskCreatedAt = LocalDateTime.now(ZoneOffset.UTC);
+        LocalDateTime taskExpiresAt = taskCreatedAt.plus(props.otp().expiry());
 
-                // Human-readable work item description.
-                "Enter ICICI OTP for "
-                        + req.getReqRefName() + "/"
-                        + req.getReqRefId() + " - "
-                        + req.getAmount() + " "
-                        + req.getCurrency() + " - "
-                        + props.categoryName(req.getTxnCategCdid()),
+        WorklistTaskCreateRequest taskRequest = WorklistTaskCreateRequest.builder()
+                .taskCode(worklistTaskCode)
+                .taskName(worklistTaskName)
+                .refEntityName(worklistRefEntityName)
+                .refEntityId(String.valueOf(req.getBenAcctId()))
+                .linkedInstEntityName(linkedInstanceEntityName)
+                .linkedInstEntityId(linkedInstanceEntityId)
+                .assigneeRoleCd(worklistAssigneeRoleCode)
+                .build();
 
-                // Payment amount displayed in the worklist.
-                req.getAmount(),
+        WorklistTaskResponse taskResponse = worklistGateway.createTask(taskRequest);
+        if (taskResponse == null || taskResponse.getWklTaskId() == null) {
+            failTxn(txn, "Worklist task creation did not return wklTaskId");
+            routeToFailureQueue(req, "Worklist task creation failed");
+            return;
+        }
 
-                // OTP work item expiry time.
-                Instant.now().plus(props.otp().expiry())
-        ));
+        txn.setWklTaskId(taskResponse.getWklTaskId());
+        txn.setWklTaskCreatedTs(taskCreatedAt);
+        txn.setOtpTaskExpiresTs(taskExpiresAt);
+        touch(txn);
+
+        if (taskResponse.getStatusCode() != null
+                && !"PENDING".equalsIgnoreCase(taskResponse.getStatusCode())) {
+            log.warn("Worklist task {} was created with unexpected initial status {}",
+                    taskResponse.getWklTaskId(), taskResponse.getStatusCode());
+        }
 
         // Step 14: Mark the payment request as AWAITING_OTP.
         //
@@ -663,17 +703,146 @@ public class PaymentWorkflowService {
      *
      * A new payment is not started while this request remains AWAITING_OTP.
      */
+    /**
+     * Handles a PaymentRequest that is currently waiting for OTP authorization.
+     *
+     * This method is called by the payment scheduler when the request
+     * status is AWAITING_OTP.
+     *
+     * It checks the external Worklist task status and determines whether
+     * to continue waiting, expire the task, or handle a changed task status.
+     */
     private void continueAwaitingOtp(PaymentRequest req) {
+
+        // STEP 1: Get the latest payment transaction associated with this request.
+        // Each retry can create a new PaymentTxn, so we must check the latest transaction.
         PaymentTxn txn = latestTxn(req);
-        OtpStatus status = worklist.otpStatus(txn.getPymntTxnId());
-        switch (status.state()) {
-            case COMPLETED -> submit(req, txn, status.otp());
-            case EXPIRED, MISSING, CONSUMED -> {
-                failTxn(txn, "OTP was not entered in time");
-                routeToFailureQueue(req, "OTP was not entered in time");   // the retry creates a new OTP work item
+
+        // STEP 2: Validate that the payment transaction has an associated Worklist task ID.
+        // Without this ID, Payment Service cannot communicate with the external Worklist Service.
+        if (txn.getWklTaskId() == null) {
+            log.error(
+                    "Payment transaction {} has no Worklist task ID while awaiting OTP",
+                    txn.getPymntTxnId()
+            );
+            return;
+        }
+
+        // STEP 3: Fetch the latest Worklist task details from the external Worklist Service.
+        // This allows Payment Service to check whether Accounts has started or completed the task.
+        WorklistTaskResponse task =
+                worklistGateway.getTask(txn.getWklTaskId());
+
+        // STEP 4: Handle the case where the Worklist Service does not return the task.
+        // Do not fail or retry the payment just because the task response is unavailable.
+        // Keep the payment request in AWAITING_OTP.
+        if (task == null) {
+            log.warn(
+                    "Worklist task {} was not returned; payment remains awaiting OTP",
+                    txn.getWklTaskId()
+            );
+            return;
+        }
+
+        // STEP 5: Read the current status of the Worklist task.
+        String status = task.getStatusCode();
+
+        // STEP 6: Check whether the task is still waiting for Accounts action
+        // or Accounts has already started working on it.
+        if ("PENDING".equalsIgnoreCase(status)
+                || "IN_PROGRESS".equalsIgnoreCase(status)) {
+
+            // STEP 7: Get the current UTC time.
+            // This is compared with the task expiry timestamp saved in PaymentTxn.
+            LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+
+            // STEP 8: Check whether the OTP entry window has expired.
+            // isBefore() returns false when now is equal to or later than the expiry time.
+            if (txn.getOtpTaskExpiresTs() != null
+                    && !now.isBefore(txn.getOtpTaskExpiresTs())) {
+
+                // STEP 9: Re-fetch the Worklist task before cancelling it.
+                // This protects against cancelling a task whose status changed
+                // between the first GET request and the expiry check.
+                WorklistTaskResponse latest =
+                        worklistGateway.getTask(txn.getWklTaskId());
+
+                String latestStatus =
+                        latest == null ? null : latest.getStatusCode();
+
+                // STEP 10: Cancel the task only if it is still PENDING or IN_PROGRESS.
+                // If its status has changed, do not blindly cancel it.
+                if ("PENDING".equalsIgnoreCase(latestStatus)
+                        || "IN_PROGRESS".equalsIgnoreCase(latestStatus)) {
+
+                    // STEP 11: Update the external Worklist task status to CANCELLED.
+                    // Accounts can no longer continue with this expired task.
+                    worklistGateway.updateTaskStatus(
+                            txn.getWklTaskId(),
+                            "CANCELLED"
+                    );
+
+                    // STEP 12: Mark the current payment transaction as FAILED.
+                    // This transaction's OTP entry window has expired.
+                    failTxn(txn, "OTP entry window expired");
+
+                    // STEP 13: Route the original PaymentRequest to the appropriate
+                    // retry queue. If retries are exhausted, route it to
+                    // MANUAL_INTERVENTION according to the existing retry rules.
+                    routeToFailureQueue(req, "OTP entry window expired");
+                }
+
+            } else {
+
+                // STEP 14: The task has not expired.
+                // Keep the payment request in AWAITING_OTP.
+                // The scheduler will check the task again during its next polling cycle.
+                log.info(
+                        "Waiting for Accounts OTP for Worklist task {}",
+                        txn.getWklTaskId()
+                );
             }
-            case OPEN -> { log.info("Waiting for OTP"); /* still waiting for the Accounts team; no other payment may
-            start */ }
+
+            // STEP 15: Return because the payment is still awaiting OTP
+            // or its expiry has just been handled.
+            // Do not start another payment from this execution.
+            return;
+        }
+
+        // STEP 16: Handle the case where Accounts or another authorized user
+        // has cancelled the Worklist task.
+        if ("CANCELLED".equalsIgnoreCase(status)) {
+
+            // Mark the current payment transaction as FAILED.
+            failTxn(txn, "OTP Worklist task was cancelled");
+
+            // Route the original payment request through the configured failure/retry rules.
+            routeToFailureQueue(req, "OTP Worklist task was cancelled");
+
+        }
+
+        // STEP 17: Handle COMPLETED Worklist tasks.
+        // Worklist completion alone does not mean the bank has received the OTP.
+        // OTP must be submitted through the Payment Service endpoint.
+        else if ("COMPLETED".equalsIgnoreCase(status)) {
+
+            log.warn(
+                    "Worklist task {} is COMPLETED while payment request {} is still AWAITING_OTP; "
+                            + "OTP must be submitted through Payment Service",
+                    txn.getWklTaskId(),
+                    req.getPymntReqId()
+            );
+        }
+
+        // STEP 18: Handle any unexpected Worklist task status.
+        // Do not automatically fail the payment for an unknown status.
+        else {
+
+            log.warn(
+                    "Unexpected Worklist status '{}' for task {}",
+                    status,
+                    txn.getWklTaskId()
+            );
         }
     }
 
@@ -720,12 +889,119 @@ public class PaymentWorkflowService {
                     "Transaction ID does not match");
         }
 
-        // Step 5: Call the existing protected submit() method.
-        // The atomic database claim inside submit() ensures
-        // that the API and scheduler cannot both submit this transaction.
-        submit(req, txn, request.otp());
+        // Preserve the legacy route, but delegate to the new Worklist-task flow
+        // so every OTP submission validates and completes the external task.
+        if (txn.getWklTaskId() == null) {
+            throw new InvalidPaymentRequestException("No Worklist task is associated with this transaction");
+        }
+        processOtpByWorklistTaskId(txn.getWklTaskId(), request.otp());
     }
 
+
+
+    /**
+     * Processes the OTP submitted by the Accounts user against a Worklist task.
+     *
+     * This method validates the OTP, verifies the associated payment request
+     * and transaction, checks task expiry and Worklist status, and then
+     * submits the OTP to the bank through the existing payment flow.
+     */
+    public void processOtpByWorklistTaskId(Long taskId, String otp) {
+
+        // STEP 1: Validate the incoming task ID and OTP.
+        // OTP must contain only numeric digits and must be between 4 and 10 digits.
+        if (taskId == null || otp == null || !otp.matches("\\d{4,10}")) {
+            throw new InvalidOtpException("OTP must contain 4-10 digits");
+        }
+
+        // STEP 2: Find the payment transaction associated with this Worklist task ID.
+        // Each Worklist task is linked to a specific PaymentTxn.
+        // If no transaction exists, the supplied task ID is invalid.
+        PaymentTxn txn = txns.findByWklTaskId(taskId)
+                .orElseThrow(() ->
+                        new PaymentTransactionNotFoundException(taskId));
+
+        // STEP 3: Find the original PaymentRequest associated with this transaction.
+        // This is important because retry transactions can have different transaction IDs
+        // but belong to the same original PaymentRequest.
+        PaymentRequest req = requests.findById(txn.getPymntReqId())
+                .orElseThrow(() ->
+                        new PaymentRequestNotFoundException(txn.getPymntReqId()));
+
+        // STEP 4: Verify that the payment request and transaction are both
+        // in the expected states for OTP submission.
+        //
+        // PaymentRequest must be AWAITING_OTP.
+        // PaymentTxn must be OTP_REQUESTED.
+        //
+        // If either status has changed, OTP submission must not continue.
+        if (req.getProcStatus() != ProcStatus.AWAITING_OTP
+                || txn.getTxnStatus() != TxnStatus.OTP_REQUESTED) {
+
+            throw new PaymentAlreadyProcessedException(
+                    "Payment is not awaiting OTP");
+        }
+
+        // STEP 5: Get the current UTC time.
+        // This is compared with the OTP task expiry timestamp stored
+        // against the individual PaymentTxn.
+        LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+
+        // STEP 6: Check whether the OTP entry window has expired.
+        // If current time is equal to or later than the expiry time,
+        // OTP submission must be rejected.
+        if (txn.getOtpTaskExpiresTs() != null
+                && !now.isBefore(txn.getOtpTaskExpiresTs())) {
+
+            // STEP 7: Fetch the latest Worklist task status before cancellation.
+            // Cancel only if the task is still PENDING or IN_PROGRESS.
+            WorklistTaskResponse latest = worklistGateway.getTask(taskId);
+
+            if (latest != null
+                    && ("PENDING".equalsIgnoreCase(latest.getStatusCode())
+                    || "IN_PROGRESS".equalsIgnoreCase(latest.getStatusCode()))) {
+
+                // STEP 8: Mark the expired Worklist task as CANCELLED.
+                worklistGateway.updateTaskStatus(taskId, "CANCELLED");
+            }
+
+            // STEP 9: Mark the current payment transaction as FAILED
+            // because its OTP entry window has expired.
+            failTxn(txn, "OTP entry window expired");
+
+            // STEP 10: Route the original PaymentRequest to the next
+            // configured retry queue, or MANUAL_INTERVENTION if retries are exhausted.
+            routeToFailureQueue(req, "OTP entry window expired");
+
+            // STEP 11: Reject the submitted OTP.
+            throw new InvalidOtpException("OTP entry window has expired");
+        }
+
+        // STEP 12: Fetch the latest Worklist task status.
+        // OTP submission is allowed only when the task is still PENDING
+        // or IN_PROGRESS.
+        WorklistTaskResponse task = worklistGateway.getTask(taskId);
+
+        // STEP 13: Reject OTP submission if the task does not exist
+        // or is already completed, cancelled, or in another unexpected state.
+        if (task == null
+                || !("PENDING".equalsIgnoreCase(task.getStatusCode())
+                || "IN_PROGRESS".equalsIgnoreCase(task.getStatusCode()))) {
+
+            throw new PaymentAlreadyProcessedException(
+                    "Worklist task is not available for OTP submission");
+        }
+
+        // STEP 14: Update the external Worklist task status to COMPLETED.
+        // This is done only after validating the payment association,
+        // transaction status, OTP format, task status, and expiry.
+        worklistGateway.updateTaskStatus(taskId, "COMPLETED");
+
+        // STEP 15: Submit the OTP through the existing bank payment flow.
+        // The existing submit() method communicates with the bank
+        // and applies the payment response/resolution.
+        submit(req, txn, otp);
+    }
 
 
     /**
@@ -775,7 +1051,8 @@ public class PaymentWorkflowService {
 
         // STEP 4: Consume the OTP work item.
         // This prevents the OTP from being reused.
-        worklist.consumeOtp(txn.getPymntTxnId());
+        // OTP is supplied directly by the Accounts UI to Payment Service in the new flow.
+        // Worklist status is updated through the external Worklist REST API. No local OTP is stored.
 
         Payer payer = payers.findById(txn.getPayerId()).orElseThrow();
         BenefSnapshot snapshot = snapshots.findById(txn.getBeniSnapId()).orElseThrow();
@@ -925,7 +1202,7 @@ public class PaymentWorkflowService {
         req.setLastReason(reason);
         save(req);
         Long txnId = txns.findFirstByPymntReqIdOrderByPymntTxnIdDesc(req.getPymntReqId()).map(PaymentTxn::getPymntTxnId).orElse(null);
-        worklist.createManualInterventionItem(new ManualWorkItem(req.getPymntReqId(), txnId,
+        manualWorklist.createManualInterventionItem(new ManualWorkItem(req.getPymntReqId(), txnId,
                 "Manual intervention: " + req.getReqRefName() + "/" + req.getReqRefId()
                         + " - " + req.getAmount() + " " + req.getCurrency(), reason));
         events.publish(req);

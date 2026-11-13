@@ -4,16 +4,13 @@ spring:
   profiles:
     default: dev
   datasource:
-    url: jdbc:postgresql://localhost:5432/paymentdb
-    username: postgres
+    url: jdbc:sqlserver://CITC-CCU-TC-D05;databaseName=C3;encrypt=true;trustServerCertificate=true
+    username: C3SvcAccount
     password: Welcome@1234
-    driver-class-name: org.postgresql.Driver
-  flyway:
-    enabled: true
-    locations: classpath:db/migration
+    driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
   jpa:
     hibernate:
-      ddl-auto: validate
+      ddl-auto: update
     open-in-view: false
     properties:
       hibernate:
@@ -60,7 +57,7 @@ payment:
     inquiry-delay: PT15M
     max-inquiries: 12
   otp:
-    expiry: PT15M
+    expiry: PT5M
   txn-categories:
     "1024": SALARY_PAYMENT
     "1025": VENDOR_PAYMENT
@@ -107,13 +104,40 @@ server:
   port: 8080
 
 management:
+  endpoint:
+    health:
+      show-details: when_authorized
   endpoints:
     web:
       exposure:
         include: health,info,metrics
+  info:
+    env:
+      enabled: true
 
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+
+info:
+  app:
+    name: Payment Service
+    description: Payment orchestration and ICICI integration
+    version: 0.2.0
 
 worklist:
   service:
     base-url: ${WORKLIST_SERVICE_URL:http://localhost:9090}
     task-create-path: /api/v1/worklist/tasks
+    task-by-id-path: /api/v1/worklist/tasks/{taskId}
+    task-status-path: /api/v1/worklist/tasks/{taskId}/status
+    task-code: PAYMENT_OTP_AUTHORIZATION
+    task-name: Authorize Payment Transaction
+    ref-entity-name: BENEFICIARY
+    linked-instance-entity-name: ONBOARDING
+    linked-instance-entity-id: 1001
+    assignee-role-code: ACCOUNTS

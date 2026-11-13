@@ -4,6 +4,7 @@ import com.company.payment.domain.enums.TxnStatus;
 import jakarta.persistence.*;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import lombok.*;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
@@ -80,4 +81,14 @@ public class PaymentTxn {
 
     @Column(name = "updated_ts")
     private Instant updatedTs;
+
+    /** External Worklist task associated with this specific payment attempt. */
+    @Column(name = "wkl_task_id")
+    private Long wklTaskId;
+
+    @Column(name = "wkl_task_created_ts")
+    private LocalDateTime wklTaskCreatedTs;
+
+    @Column(name = "otp_task_expires_ts")
+    private LocalDateTime otpTaskExpiresTs;
 }

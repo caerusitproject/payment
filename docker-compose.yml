@@ -1,19 +1,19 @@
 services:
-  postgres:
-    image: postgres:16
-    container_name: payment-postgres
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: payment-sqlserver
     environment:
-      POSTGRES_DB: paymentdb
-      POSTGRES_USER: payment_user
-      POSTGRES_PASSWORD: change-me
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in your environment}
     ports:
-      - "5432:5432"
+      - "1433:1433"
     volumes:
-      - payment_pg_data:/var/lib/postgresql/data
+      - payment_sql_data:/var/opt/mssql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U payment_user -d paymentdb"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 20
 
   kafka:
@@ -27,7 +27,6 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -35,4 +34,4 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
 volumes:
-  payment_pg_data:
+  payment_sql_data:

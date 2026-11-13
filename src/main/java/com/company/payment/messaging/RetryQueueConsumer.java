@@ -9,7 +9,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
-/** Consumes retry queue events. PostgreSQL lock guarantees one payment/OTP flow across pods. */
+/** Consumes retry queue events. SQL Server application lock guarantees one payment/OTP flow across pods. */
 @Slf4j
 @Component
 @RequiredArgsConstructor
