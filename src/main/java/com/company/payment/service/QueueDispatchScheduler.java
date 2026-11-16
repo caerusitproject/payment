@@ -39,6 +39,7 @@ public class QueueDispatchScheduler {
     /** Publishes the oldest due row; consumer-side conditional updates prevent duplicate processing. */
     private void dispatch(QueueType queue, ProcStatus status, Instant now) {
         Optional<PaymentRequest> oldestDue =
+                //QueueDispatchScheduler periodically checks the database and finds payment requests whose nextAttemptAt time has already arrived or passed.
                 requests.findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
                         queue, status, now);
         oldestDue.ifPresent(publisher::publish);
