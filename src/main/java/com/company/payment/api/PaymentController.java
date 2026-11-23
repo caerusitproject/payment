@@ -252,8 +252,7 @@ public class PaymentController {
             @PathVariable Long paymentRequestId,
             @Valid @RequestBody OtpSubmitRequest request) {
 
-        // Acquire the same SQL Server execution lock used by the scheduler
-        // and retry consumer to prevent concurrent payment execution.
+        // Acquire the same in-process execution guard used by the retry consumer to prevent concurrent payment execution.
         boolean acquired = executionLock.executeIfAcquired(
                 () -> workflow.processOtp(paymentRequestId, request)
         );

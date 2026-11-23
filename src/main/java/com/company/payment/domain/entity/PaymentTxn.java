@@ -12,7 +12,10 @@ import org.hibernate.type.SqlTypes;
 /** One bank attempt for a payment request. Every (re)initiation creates a new row with a new unique id. */
 @Entity
 @Table(name = "c3_pymnt_txn",
-        uniqueConstraints = @UniqueConstraint(name = "uk_pymnt_txn_uid", columnNames = "unique_id"))
+        uniqueConstraints = {
+                @UniqueConstraint(name = "uk_pymnt_txn_uid", columnNames = "unique_id"),
+                @UniqueConstraint(name = "uk_pymnt_txn_req_attempt", columnNames = {"pymnt_req_id", "attempt_num"})
+        })
 @Getter @Setter @Builder @NoArgsConstructor @AllArgsConstructor @ToString
 public class PaymentTxn {
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -91,4 +94,11 @@ public class PaymentTxn {
 
     @Column(name = "otp_task_expires_ts")
     private LocalDateTime otpTaskExpiresTs;
+
+    /** External Worklist task created for manual payment investigation. */
+    @Column(name = "manual_wkl_task_id")
+    private Long manualWklTaskId;
+
+    @Column(name = "manual_wkl_task_created_ts")
+    private LocalDateTime manualWklTaskCreatedTs;
 }

@@ -17,8 +17,6 @@ import com.company.payment.exception.PaymentAlreadyProcessedException;
 import com.company.payment.exception.PaymentRequestNotFoundException;
 import com.company.payment.exception.PaymentTransactionNotFoundException;
 import com.company.payment.exception.InvalidOtpException;
-import com.company.payment.messaging.QueueEventPublisher;
-import com.company.payment.worklist.*;
 import com.company.payment.gateway.worklist.dto.WorklistTaskCreateRequest;
 import com.company.payment.gateway.worklist.dto.WorklistTaskResponse;
 import java.time.LocalDateTime;
@@ -43,20 +41,17 @@ import org.springframework.beans.factory.annotation.Value;
  *
  * <h2>How the entry points are used</h2>
  * <ul>
- *   <li>{@link #tick()} is called by {@code PaymentProcessorScheduler}. It advances an existing
- *       IN_PROGRESS/AWAITING_OTP request or starts one due NEW request.</li>
- *   <li>{@link #processRetryEvent(Long, QueueType)} is called by the retry Kafka consumer.
+ *   <li>{@link #startNextPayment()} is called directly by the NEW Kafka listener after persistence.
+ *       It starts the next due NEW request without a NEW-queue polling scheduler.</li>
+ *   <li>{@link #processDueRetryQueue(QueueType)} is called by the DB-backed retry schedulers.
  *       It rechecks the database state and due time before starting a retry.</li>
- *   <li>{@link #processPendingEvent(Long)} is called by the separate pending Kafka consumer.
+ *   <li>{@link #processPendingEvent(Long)} is called by the independent SQL-backed pending inquiry scheduler.
  *       It calls TransactionInquiry for the existing attempt and never creates another payment or OTP.</li>
  * </ul>
  *
  * <h2>Sequential payment rule</h2>
- * The payment scheduler and retry consumer must use the same distributed
- * {@code PaymentExecutionLock}. This class also checks for an IN_PROGRESS or AWAITING_OTP request
- * before starting work. Together, these controls are intended to ensure that only one payment is
- * actively using the Accounts OTP worklist at a time. The {@code synchronized} keyword alone only
- * protects this object inside one JVM; it is not a distributed lock.
+ * The Kafka NEW listener, three DB-backed retry schedulers and OTP submission endpoint share
+ * the sequential payment slot. This is designed for the agreed single-instance deployment.
  *
  * <h2>Bank-call safety</h2>
  * State is persisted before an external bank call. In particular, a transaction is marked SUBMITTED
@@ -86,13 +81,13 @@ public class PaymentWorkflowService {
     // External Worklist REST integration for OTP tasks.
     private final com.company.payment.gateway.worklist.WorklistGateway worklistGateway;
 
-    // Retained only for the existing local manual-intervention fallback until its
-    // external Worklist task definition/contract is supplied.
-    private final com.company.payment.worklist.WorklistGateway manualWorklist;
-
     private final RetryPolicy retryPolicy;
     private final PaymentProperties props;
-    private final QueueEventPublisher events;
+    private final ListenerControl listenerControl;
+    private final PaymentExecutionLock executionLock;
+
+    /** Retry stage whose multi-item run is paused while a higher-priority NEW request runs. */
+    private volatile QueueType activeRetryQueue;
 
     @Value("${worklist.service.task-code:PAYMENT_OTP_AUTHORIZATION}")
     private String worklistTaskCode;
@@ -131,6 +126,17 @@ public class PaymentWorkflowService {
      * {@link #processPendingEvent(Long)} through a separate Kafka consumer, so a slow inquiry
      * cannot block the sequential payment/OTP pipeline.</p>
      */
+    /** Starts the next persisted NEW request immediately after Kafka intake commits it. */
+    public synchronized void startNextPayment() {
+        executionLock.executeIfAcquired(this::tick);
+    }
+
+    /** Expires overdue OTP work items only; this never polls or starts NEW payments. */
+    public synchronized void expireAwaitingOtpRequests() {
+        requests.findFirstByProcStatusIn(List.of(ProcStatus.AWAITING_OTP))
+                .ifPresent(this::continueAwaitingOtp);
+    }
+
     public synchronized void tick() {
 
         // Capture the current time once for consistent database eligibility checks.
@@ -208,22 +214,24 @@ public class PaymentWorkflowService {
          * - next_attempt_at <= current time
          *
          * Retry requests are not selected here because they are triggered
-         * through their dedicated Kafka retry queues.
+         * through their dedicated database-backed retry schedulers.
          *
          * Pending requests are also excluded because their inquiries are
-         * processed independently by PendingQueueConsumer.
+         * processed independently by PendingInquiryScheduler.
          */
         Optional<PaymentRequest> next =
                 nextDue(QueueType.NEW, ProcStatus.QUEUED, now);
 
         /*
-         * STEP 5: Start the payment if an eligible NEW request exists.
+         * STEP 5: Start the oldest eligible NEW request, if one exists.
          *
-         * If a request is found:
-         *   -> startPayment() is called.
+         * This method is called by the NEW Kafka listener after intake.store()
+         * commits the request. It is not a NEW-queue polling scheduler.
          *
-         * If no request is found:
-         *   -> Nothing happens in this scheduler cycle.
+         * When a retry stage is paused, NEW requests are still processed here.
+         * The retry stage is resumed by resumeListenerAndStartQueuedNew() only
+         * after the current NEW payment resolves and no persisted NEW request
+         * is waiting.
          */
         next.ifPresent(this::startPayment);
     }
@@ -236,52 +244,203 @@ public class PaymentWorkflowService {
         return requests.findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(queue, status, now);
     }
 
+
     /**
-     * Entry point used by RetryQueueConsumer after a retry event is received from Kafka.
+     * Starts the oldest eligible payment request for the specified retry stage
+     * directly from SQL Server.
      *
-     * <p>Kafka delivery is at-least-once, so this method must not trust the event by itself.
-     * It reloads the payment request and verifies its current queue, status and due time. A stale
-     * or duplicate event is therefore a no-op.</p>
+     * This method is invoked by RETRY_1, RETRY_2 and RETRY_3 schedulers.
+     * Retry requests are fetched directly from the database; no retry Kafka
+     * topic or retry Kafka consumer is involved.
      *
-     * <p>The caller must acquire the shared PaymentExecutionLock before invoking this method.</p>
-     *
-     * @param paymentRequestId database ID of the original payment request
-     * @param expectedQueue retry stage represented by the Kafka topic
+     * Execution rules:
+     * 1. Only one retry cycle can be active at a time.
+     * 2. NEW payment requests always have priority over retries.
+     * 3. The NEW Kafka listener must be paused before a retry starts.
+     * 4. The retry execution remains active during asynchronous OTP processing.
+     * 5. Scheduler triggers received during an active retry cycle are skipped.
+     * 6. Retry priority is RETRY_1 -> RETRY_2 -> RETRY_3.
      */
-    public synchronized void processRetryEvent(Long paymentRequestId, QueueType expectedQueue) {
-        PaymentRequest req = requests.findById(paymentRequestId).orElse(null);
-        if (req == null || req.getQueueType() != expectedQueue
-                || req.getProcStatus() != ProcStatus.RETRY_WAIT
-                || req.getNextAttemptAt() == null
-                || req.getNextAttemptAt().isAfter(Instant.now())) {
+
+
+
+//    RETRY Scheduler
+//      |
+//    v
+//    Check NEW requests
+//      |
+//              +---- NEW exists ----> Resume NEW Kafka listener
+//      |                            |
+//              |                            v
+//      |                      Process NEW payments
+//      |                            |
+//              |                      Check NEW again
+//      |                            |
+//              |                      Resume RETRY
+//      |
+//              +---- No NEW -------> Pause NEW Kafka listener
+//                                   |
+//    v
+//    Start retry payment
+//                                   |
+//    v
+//    Wait for OTP
+//                                   |
+//    v
+//    Submit to ICICI
+//                                   |
+//    v
+//    Resolve payment
+//                                   |
+//    v
+//    Check NEW requests again
+
+
+
+
+    public synchronized void processDueRetryQueue(QueueType expectedQueue) {
+
+        // Accept only the three supported retry stages.
+        if (expectedQueue != QueueType.RETRY_1
+                && expectedQueue != QueueType.RETRY_2
+                && expectedQueue != QueueType.RETRY_3) {
+
+            throw new IllegalArgumentException(
+                    "Not a retry queue: " + expectedQueue);
+        }
+
+        Instant now = Instant.now();
+
+        // Another retry cycle is already active.
+        if (activeRetryQueue != null) {
+
+            log.debug(
+                    "Skipping {} trigger because {} retry cycle is already active",
+                    expectedQueue,
+                    activeRetryQueue);
+
             return;
         }
 
-        // Honour the configured order: NEW, RETRY_1, RETRY_2, RETRY_3.
-        if (hasHigherPriorityDue(expectedQueue, Instant.now())) {
-            return; // Queue dispatcher will publish another wake-up.
+        // NEW requests always have higher priority than retry requests.
+        boolean newRequestAvailable =
+                requests.findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
+                        QueueType.NEW,
+                        ProcStatus.QUEUED,
+                        now
+                ).isPresent();
+
+        if (newRequestAvailable) {
+
+            // Reserve this retry stage until NEW processing is completed.
+            activeRetryQueue = expectedQueue;
+
+            log.info(
+                    "NEW payment requests are available. Deferring {} and processing NEW requests first.",
+                    expectedQueue);
+
+            // Process NEW through the common execution-lock entry point.
+            startNextPayment();
+
+            return;
         }
 
-        // Do not create another OTP work item while another payment is awaiting OTP.
-        if (requests.findFirstByProcStatusIn(List.of(ProcStatus.IN_PROGRESS, ProcStatus.AWAITING_OTP)).isPresent()) {
-            return; // Queue dispatcher will publish another wake-up when this request is due again.
+        // Do not initiate a retry if another payment is already active.
+        // This includes a NEW payment waiting for OTP.
+        boolean paymentAlreadyActive =
+                requests.findFirstByProcStatusIn(
+                        List.of(
+                                ProcStatus.IN_PROGRESS,
+                                ProcStatus.AWAITING_OTP
+                        )
+                ).isPresent();
+
+        if (paymentAlreadyActive) {
+
+            log.debug(
+                    "Skipping {} because another payment attempt is active",
+                    expectedQueue);
+
+            return;
         }
-        startPayment(req);
+
+        // Preserve retry priority:
+        // RETRY_2 cannot overtake an eligible RETRY_1.
+        // RETRY_3 cannot overtake an eligible RETRY_1 or RETRY_2.
+        if (hasHigherPriorityDue(expectedQueue, now)) {
+
+            log.debug(
+                    "Skipping {} because a higher-priority retry is eligible",
+                    expectedQueue);
+
+            return;
+        }
+
+        // Fetch the oldest eligible request from this retry queue.
+        Optional<PaymentRequest> eligibleRequest =
+                requests.findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
+                        expectedQueue,
+                        ProcStatus.valueOf(expectedQueue.name()),
+                        now
+                );
+
+        if (eligibleRequest.isEmpty()) {
+
+            log.debug(
+                    "No eligible payment requests found in {}",
+                    expectedQueue);
+
+            return;
+        }
+
+        PaymentRequest req = eligibleRequest.get();
+
+        // Reserve the retry execution before starting payment.
+        activeRetryQueue = expectedQueue;
+
+        try {
+
+            log.info(
+                    "Starting {} from database: paymentRequestId={}",
+                    expectedQueue,
+                    req.getPymntReqId());
+
+            // startPayment() handles listener pause.
+            // activeRetryQueue remains reserved until resolution.
+            startPayment(req);
+
+        } catch (Exception ex) {
+
+            log.error(
+                    "Retry initiation failed for queue {} and paymentRequestId={}. "
+                            + "Routing to manual intervention to avoid unsafe resubmission.",
+                    expectedQueue,
+                    req.getPymntReqId(),
+                    ex);
+
+            // Do not blindly retry after an uncertain bank/API operation.
+            toManual(
+                    req,
+                    "Retry initiation failed; manual review required: "
+                            + truncate(ex.getMessage(), 700)
+            );
+        }
     }
+
+
 
     /**
      * Prevents a lower-priority retry stage from overtaking work that is already due
      * in a higher-priority queue. Example: RETRY_2 must wait if NEW or RETRY_1 work is due.
      */
     private boolean hasHigherPriorityDue(QueueType currentQueue, Instant now) {
-        // The configured order is shared by all retry consumers, even though each retry
-        // stage has its own Kafka topic.
+        // The configured order is shared by the three database-backed retry schedulers.
         for (QueueType higherPriority : props.processor().priority()) {
             if (higherPriority == currentQueue) {
                 return false;
             }
             ProcStatus status = higherPriority == QueueType.NEW
-                    ? ProcStatus.QUEUED : ProcStatus.RETRY_WAIT;
+                    ? ProcStatus.QUEUED : ProcStatus.RETRY_1;
             if (requests.findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
                     higherPriority, status, now).isPresent()) {
                 return true;
@@ -291,7 +450,7 @@ public class PaymentWorkflowService {
     }
 
     /**
-     * Entry point used by PendingQueueConsumer.
+     * Entry point invoked by the SQL-backed PendingInquiryScheduler.
      *
      * <p>This pipeline is deliberately independent of the payment/OTP execution lock. It only
      * performs TransactionInquiry for the latest attempt's existing UNIQUEID. It must never call
@@ -357,6 +516,9 @@ public class PaymentWorkflowService {
      */
     private void startPayment(PaymentRequest req) {
 
+
+        // Pause NEW Kafka intake while this payment occupies the execution slot.
+        listenerControl.pause();
         // Step 1: Update the retry count.
         //
         // For an initial payment (NEW queue), retryCount remains 0.
@@ -713,139 +875,27 @@ public class PaymentWorkflowService {
      * to continue waiting, expire the task, or handle a changed task status.
      */
     private void continueAwaitingOtp(PaymentRequest req) {
-
-        // STEP 1: Get the latest payment transaction associated with this request.
-        // Each retry can create a new PaymentTxn, so we must check the latest transaction.
+        // OTP is submitted to Payment Service by Accounts; no local Worklist polling is needed.
         PaymentTxn txn = latestTxn(req);
-
-        // STEP 2: Validate that the payment transaction has an associated Worklist task ID.
-        // Without this ID, Payment Service cannot communicate with the external Worklist Service.
         if (txn.getWklTaskId() == null) {
-            log.error(
-                    "Payment transaction {} has no Worklist task ID while awaiting OTP",
-                    txn.getPymntTxnId()
-            );
+            log.error("Payment transaction {} has no external Worklist task ID", txn.getPymntTxnId());
+            toManual(req, "OTP task reference is missing");
             return;
         }
 
-        // STEP 3: Fetch the latest Worklist task details from the external Worklist Service.
-        // This allows Payment Service to check whether Accounts has started or completed the task.
-        WorklistTaskResponse task =
-                worklistGateway.getTask(txn.getWklTaskId());
-
-        // STEP 4: Handle the case where the Worklist Service does not return the task.
-        // Do not fail or retry the payment just because the task response is unavailable.
-        // Keep the payment request in AWAITING_OTP.
-        if (task == null) {
-            log.warn(
-                    "Worklist task {} was not returned; payment remains awaiting OTP",
-                    txn.getWklTaskId()
-            );
+        LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+        if (txn.getOtpTaskExpiresTs() != null && !now.isBefore(txn.getOtpTaskExpiresTs())) {
+            // The database expiry timestamp is authoritative. Cancel the external task by ID.
+            worklistGateway.updateTaskStatus(txn.getWklTaskId(), "CANCELLED");
+            failTxn(txn, "OTP entry window expired");
+            routeToFailureQueue(req, "OTP entry window expired");
             return;
         }
 
-        // STEP 5: Read the current status of the Worklist task.
-        String status = task.getStatusCode();
-
-        // STEP 6: Check whether the task is still waiting for Accounts action
-        // or Accounts has already started working on it.
-        if ("PENDING".equalsIgnoreCase(status)
-                || "IN_PROGRESS".equalsIgnoreCase(status)) {
-
-            // STEP 7: Get the current UTC time.
-            // This is compared with the task expiry timestamp saved in PaymentTxn.
-            LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
-
-            // STEP 8: Check whether the OTP entry window has expired.
-            // isBefore() returns false when now is equal to or later than the expiry time.
-            if (txn.getOtpTaskExpiresTs() != null
-                    && !now.isBefore(txn.getOtpTaskExpiresTs())) {
-
-                // STEP 9: Re-fetch the Worklist task before cancelling it.
-                // This protects against cancelling a task whose status changed
-                // between the first GET request and the expiry check.
-                WorklistTaskResponse latest =
-                        worklistGateway.getTask(txn.getWklTaskId());
-
-                String latestStatus =
-                        latest == null ? null : latest.getStatusCode();
-
-                // STEP 10: Cancel the task only if it is still PENDING or IN_PROGRESS.
-                // If its status has changed, do not blindly cancel it.
-                if ("PENDING".equalsIgnoreCase(latestStatus)
-                        || "IN_PROGRESS".equalsIgnoreCase(latestStatus)) {
-
-                    // STEP 11: Update the external Worklist task status to CANCELLED.
-                    // Accounts can no longer continue with this expired task.
-                    worklistGateway.updateTaskStatus(
-                            txn.getWklTaskId(),
-                            "CANCELLED"
-                    );
-
-                    // STEP 12: Mark the current payment transaction as FAILED.
-                    // This transaction's OTP entry window has expired.
-                    failTxn(txn, "OTP entry window expired");
-
-                    // STEP 13: Route the original PaymentRequest to the appropriate
-                    // retry queue. If retries are exhausted, route it to
-                    // MANUAL_INTERVENTION according to the existing retry rules.
-                    routeToFailureQueue(req, "OTP entry window expired");
-                }
-
-            } else {
-
-                // STEP 14: The task has not expired.
-                // Keep the payment request in AWAITING_OTP.
-                // The scheduler will check the task again during its next polling cycle.
-                log.info(
-                        "Waiting for Accounts OTP for Worklist task {}",
-                        txn.getWklTaskId()
-                );
-            }
-
-            // STEP 15: Return because the payment is still awaiting OTP
-            // or its expiry has just been handled.
-            // Do not start another payment from this execution.
-            return;
-        }
-
-        // STEP 16: Handle the case where Accounts or another authorized user
-        // has cancelled the Worklist task.
-        if ("CANCELLED".equalsIgnoreCase(status)) {
-
-            // Mark the current payment transaction as FAILED.
-            failTxn(txn, "OTP Worklist task was cancelled");
-
-            // Route the original payment request through the configured failure/retry rules.
-            routeToFailureQueue(req, "OTP Worklist task was cancelled");
-
-        }
-
-        // STEP 17: Handle COMPLETED Worklist tasks.
-        // Worklist completion alone does not mean the bank has received the OTP.
-        // OTP must be submitted through the Payment Service endpoint.
-        else if ("COMPLETED".equalsIgnoreCase(status)) {
-
-            log.warn(
-                    "Worklist task {} is COMPLETED while payment request {} is still AWAITING_OTP; "
-                            + "OTP must be submitted through Payment Service",
-                    txn.getWklTaskId(),
-                    req.getPymntReqId()
-            );
-        }
-
-        // STEP 18: Handle any unexpected Worklist task status.
-        // Do not automatically fail the payment for an unknown status.
-        else {
-
-            log.warn(
-                    "Unexpected Worklist status '{}' for task {}",
-                    status,
-                    txn.getWklTaskId()
-            );
-        }
+        // Keep AWAITING_OTP and the active payment slot until Accounts submits OTP or it expires.
+        log.debug("Payment request {} remains AWAITING_OTP for Worklist task {}",
+                req.getPymntReqId(), txn.getWklTaskId());
     }
-
 
     /**
      * Processes the OTP received from the Accounts team.
@@ -907,102 +957,32 @@ public class PaymentWorkflowService {
      * submits the OTP to the bank through the existing payment flow.
      */
     public void processOtpByWorklistTaskId(Long taskId, String otp) {
-
-        // STEP 1: Validate the incoming task ID and OTP.
-        // OTP must contain only numeric digits and must be between 4 and 10 digits.
         if (taskId == null || otp == null || !otp.matches("\\d{4,10}")) {
             throw new InvalidOtpException("OTP must contain 4-10 digits");
         }
 
-        // STEP 2: Find the payment transaction associated with this Worklist task ID.
-        // Each Worklist task is linked to a specific PaymentTxn.
-        // If no transaction exists, the supplied task ID is invalid.
         PaymentTxn txn = txns.findByWklTaskId(taskId)
-                .orElseThrow(() ->
-                        new PaymentTransactionNotFoundException(taskId));
-
-        // STEP 3: Find the original PaymentRequest associated with this transaction.
-        // This is important because retry transactions can have different transaction IDs
-        // but belong to the same original PaymentRequest.
+                .orElseThrow(() -> new PaymentTransactionNotFoundException(taskId));
         PaymentRequest req = requests.findById(txn.getPymntReqId())
-                .orElseThrow(() ->
-                        new PaymentRequestNotFoundException(txn.getPymntReqId()));
+                .orElseThrow(() -> new PaymentRequestNotFoundException(txn.getPymntReqId()));
 
-        // STEP 4: Verify that the payment request and transaction are both
-        // in the expected states for OTP submission.
-        //
-        // PaymentRequest must be AWAITING_OTP.
-        // PaymentTxn must be OTP_REQUESTED.
-        //
-        // If either status has changed, OTP submission must not continue.
         if (req.getProcStatus() != ProcStatus.AWAITING_OTP
                 || txn.getTxnStatus() != TxnStatus.OTP_REQUESTED) {
-
-            throw new PaymentAlreadyProcessedException(
-                    "Payment is not awaiting OTP");
+            throw new PaymentAlreadyProcessedException("Payment is not awaiting OTP");
         }
 
-        // STEP 5: Get the current UTC time.
-        // This is compared with the OTP task expiry timestamp stored
-        // against the individual PaymentTxn.
         LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
-
-        // STEP 6: Check whether the OTP entry window has expired.
-        // If current time is equal to or later than the expiry time,
-        // OTP submission must be rejected.
-        if (txn.getOtpTaskExpiresTs() != null
-                && !now.isBefore(txn.getOtpTaskExpiresTs())) {
-
-            // STEP 7: Fetch the latest Worklist task status before cancellation.
-            // Cancel only if the task is still PENDING or IN_PROGRESS.
-            WorklistTaskResponse latest = worklistGateway.getTask(taskId);
-
-            if (latest != null
-                    && ("PENDING".equalsIgnoreCase(latest.getStatusCode())
-                    || "IN_PROGRESS".equalsIgnoreCase(latest.getStatusCode()))) {
-
-                // STEP 8: Mark the expired Worklist task as CANCELLED.
-                worklistGateway.updateTaskStatus(taskId, "CANCELLED");
-            }
-
-            // STEP 9: Mark the current payment transaction as FAILED
-            // because its OTP entry window has expired.
+        if (txn.getOtpTaskExpiresTs() != null && !now.isBefore(txn.getOtpTaskExpiresTs())) {
+            worklistGateway.updateTaskStatus(taskId, "CANCELLED");
             failTxn(txn, "OTP entry window expired");
-
-            // STEP 10: Route the original PaymentRequest to the next
-            // configured retry queue, or MANUAL_INTERVENTION if retries are exhausted.
             routeToFailureQueue(req, "OTP entry window expired");
-
-            // STEP 11: Reject the submitted OTP.
             throw new InvalidOtpException("OTP entry window has expired");
         }
 
-        // STEP 12: Fetch the latest Worklist task status.
-        // OTP submission is allowed only when the task is still PENDING
-        // or IN_PROGRESS.
-        WorklistTaskResponse task = worklistGateway.getTask(taskId);
-
-        // STEP 13: Reject OTP submission if the task does not exist
-        // or is already completed, cancelled, or in another unexpected state.
-        if (task == null
-                || !("PENDING".equalsIgnoreCase(task.getStatusCode())
-                || "IN_PROGRESS".equalsIgnoreCase(task.getStatusCode()))) {
-
-            throw new PaymentAlreadyProcessedException(
-                    "Worklist task is not available for OTP submission");
-        }
-
-        // STEP 14: Update the external Worklist task status to COMPLETED.
-        // This is done only after validating the payment association,
-        // transaction status, OTP format, task status, and expiry.
+        // The Accounts API call is the OTP submission signal; update the external task before bank submission.
         worklistGateway.updateTaskStatus(taskId, "COMPLETED");
-
-        // STEP 15: Submit the OTP through the existing bank payment flow.
-        // The existing submit() method communicates with the bank
-        // and applies the payment response/resolution.
         submit(req, txn, otp);
     }
-
 
     /**
      * Submits the payment to the bank after Accounts has supplied the OTP.
@@ -1114,9 +1094,9 @@ public class PaymentWorkflowService {
      * over RESPONSE). This method is responsible for persisting the resulting business state:</p>
      * <ul>
      *   <li>SUCCESS: close the payment request and clear its queue schedule.</li>
-     *   <li>PENDING_QUEUE: keep the same attempt and schedule another inquiry.</li>
-     *   <li>FAILURE_QUEUE: mark the attempt failed and schedule the next eligible retry.</li>
-     *   <li>MANUAL_QUEUE: preserve uncertainty and create a manual intervention task.</li>
+     *   <li>PENDING: keep the same attempt and schedule another inquiry.</li>
+     *   <li>RETRYABLE_FAILURE: mark the attempt failed and schedule the next eligible retry.</li>
+     *   <li>MANUAL_INTERVENTION: preserve uncertainty and create a manual intervention task.</li>
      * </ul>
      *
      * @param fromInquiry true when this result came from TransactionInquiry; used for inquiry limit
@@ -1132,8 +1112,9 @@ public class PaymentWorkflowService {
                 req.setCompleteTs(Instant.now());
                 req.setLastReason("Payment successful");
                 save(req);
+                resumeListenerAndStartQueuedNew();
             }
-            case PENDING_QUEUE -> {           // Money may have moved: only TransactionInquiry may decide; never re-initiate.
+            case PENDING -> {           // Money may have moved: only TransactionInquiry may decide; never re-initiate.
                 recordResponse(txn, body, TxnStatus.PENDING);
                 long inquiries = interactions.countByUniqueIdAndApiOperation(txn.getUniqueId(), ApiOperation.STATUS_INQUIRY);
                 if (fromInquiry && inquiries >= props.pending().maxInquiries()) {
@@ -1141,18 +1122,18 @@ public class PaymentWorkflowService {
                 } else {
                     req.setProcStatus(ProcStatus.PENDING);
                     req.setQueueType(QueueType.PENDING);
-                    // Persist the next inquiry due time. The dispatcher polls frequently, but
-                    // it publishes this request only after this 15-minute (configured) deadline.
+                    // Persist the next inquiry due time. The pending dispatch scheduler publishes this request only after this 15-minute deadline.
                     req.setNextAttemptAt(Instant.now().plus(props.pending().inquiryDelay()));
                     req.setLastReason(r.reason);
-                    save(req); // Queue dispatcher publishes when inquiry is due.
+                    save(req); // Pending inquiry dispatches when the due time arrives.
                 }
+                resumeListenerAndStartQueuedNew();
             }
-            case FAILURE_QUEUE -> {           // bank did not process it; retry later
+            case RETRYABLE_FAILURE -> {           // bank did not process it; retry later
                 recordResponse(txn, body, TxnStatus.FAILED);
                 routeToFailureQueue(req, r.reason);
             }
-            case MANUAL_QUEUE -> {
+            case MANUAL_INTERVENTION -> {
                 // Preserve uncertainty: do not falsely persist FAILED when the bank status is unclear.
                 String bankStatus = BankJson.field(body, "status");
                 TxnStatus storedStatus = "REVERSED".equalsIgnoreCase(bankStatus)
@@ -1170,8 +1151,8 @@ public class PaymentWorkflowService {
      * retry 3 after 2 hours. If there is no next retry step, the request is sent to
      * MANUAL_INTERVENTION. Initial attempt is not counted as a retry.</p>
      *
-     * <p>This method does not publish directly to Kafka. QueueDispatchScheduler later finds
-     * the due database row and QueueEventPublisher sends a wake-up event to the retry topic.</p>
+     * <p>The retry schedulers read the due row directly from SQL Server. No retry Kafka
+     * event is published or consumed.</p>
      */
     private void routeToFailureQueue(PaymentRequest req, String reason) {
         Optional<RetryPolicy.Step> step = retryPolicy.next(req.getRetryCount());
@@ -1180,10 +1161,11 @@ public class PaymentWorkflowService {
             return;
         }
         req.setQueueType(step.get().queue());
-        req.setProcStatus(ProcStatus.RETRY_WAIT);
+        req.setProcStatus(ProcStatus.valueOf(step.get().queue().name()));
         req.setNextAttemptAt(Instant.now().plus(step.get().delay()));
         req.setLastReason(reason);
-        save(req); // Retry dispatcher publishes only when nextAttemptAt is reached.
+        save(req); // The matching retry scheduler starts it when nextAttemptAt is reached.
+        resumeListenerAndStartQueuedNew();
         log.info("{}:{} -> {} at {}", req.getReqRefName(), req.getReqRefId(), req.getQueueType(), req.getNextAttemptAt());
     }
 
@@ -1201,11 +1183,24 @@ public class PaymentWorkflowService {
         req.setCompleted(false);
         req.setLastReason(reason);
         save(req);
-        Long txnId = txns.findFirstByPymntReqIdOrderByPymntTxnIdDesc(req.getPymntReqId()).map(PaymentTxn::getPymntTxnId).orElse(null);
-        manualWorklist.createManualInterventionItem(new ManualWorkItem(req.getPymntReqId(), txnId,
-                "Manual intervention: " + req.getReqRefName() + "/" + req.getReqRefId()
-                        + " - " + req.getAmount() + " " + req.getCurrency(), reason));
-        events.publish(req);
+
+        // Worklist owns the manual task. Payment Service stores only the external task ID.
+        PaymentTxn latest = txns.findFirstByPymntReqIdOrderByPymntTxnIdDesc(req.getPymntReqId()).orElse(null);
+        WorklistTaskResponse task = worklistGateway.createTask(WorklistTaskCreateRequest.builder()
+                .taskCode("MANUAL_INTERVENTION_ON_PAYMENT")
+                .taskName("Manual intervention on payment")
+                .refEntityName("PAYMENT_REQUEST")
+                .refEntityId(String.valueOf(req.getPymntReqId()))
+                .linkedInstEntityName("PAYMENT")
+                .linkedInstEntityId(req.getPymntReqId())
+                .assigneeRoleCd("ACCOUNTS")
+                .build());
+        if (latest != null && task != null) {
+            latest.setManualWklTaskId(task.getWklTaskId());
+            latest.setManualWklTaskCreatedTs(task.getCreatedTs());
+            txns.save(latest);
+        }
+        resumeListenerAndStartQueuedNew();
         log.warn("{}:{} -> MANUAL_INTERVENTION: {}", req.getReqRefName(), req.getReqRefId(), reason);
     }
 
@@ -1237,11 +1232,59 @@ public class PaymentWorkflowService {
             req.setNextAttemptAt(Instant.now().plus(props.pending().inquiryDelay()));
             req.setLastReason(txn.getFailureMessage());
             save(req);
-            events.publish(req);
-        } else {
+            } else {
             last.ifPresent(t -> failTxn(t, "Interrupted before bank submission"));
             routeToFailureQueue(req, "Interrupted before bank submission");
         }
+    }
+
+
+    /**
+     * Releases the completed payment attempt and gives NEW payments priority.
+     *
+     * Flow:
+     * 1. Resume NEW Kafka intake.
+     * 2. If a NEW request is already persisted, start it before another retry.
+     * 3. Keep the paused retry stage recorded while NEW requests are processed.
+     * 4. When no persisted NEW request is waiting, continue the paused retry stage.
+     * 5. If no retry stage is paused, continue normal NEW processing.
+     *
+     * The NEW listener is expected to pause itself immediately after storing
+     * each NEW message. This method checks already-persisted NEW requests.
+     * A Kafka consumer-idle/backlog signal is additionally required if the
+     * application must prove that no unread Kafka records remain before retrying.
+     */
+    private synchronized void resumeListenerAndStartQueuedNew() {
+
+        // Let the NEW listener consume waiting Kafka records first.
+        listenerControl.resume();
+
+        Instant now = Instant.now();
+        boolean newRequestWaiting = requests
+                .findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
+                        QueueType.NEW,
+                        ProcStatus.QUEUED,
+                        now)
+                .isPresent();
+
+        if (newRequestWaiting) {
+            // Start the oldest persisted NEW request. Its completion will
+            // come back here and check for the next NEW request.
+            tick();
+            return;
+        }
+
+        // No persisted NEW request is waiting. Continue the retry stage
+        // that was interrupted for NEW processing, if one is active.
+        QueueType pausedRetry = activeRetryQueue;
+        if (pausedRetry != null) {
+            activeRetryQueue = null;
+            processDueRetryQueue(pausedRetry);
+            return;
+        }
+
+        // No retry stage is waiting to resume; continue normal NEW processing.
+        tick();
     }
 
     // -------------------------------------------------------------------------

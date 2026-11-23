@@ -18,10 +18,10 @@ public record PaymentProperties(
         boolean seedReferenceData,
         Map<String, String> txnCategories) {
 
-    public record Topics(String request, String retry1, String retry2, String retry3, String pending, String manual) {}
+    public record Topics(String request) {}
 
     /** {@code priority}: queues in the order they are served (main queue first, then retry 1, 2, 3). */
-    public record Processor(long pollIntervalMs, List<QueueType> priority) {}
+    public record Processor(List<QueueType> priority) {}
 
     public record Retry(List<Duration> delays, int maxRetries) {}
 

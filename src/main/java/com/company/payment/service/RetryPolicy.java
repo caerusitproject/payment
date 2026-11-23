@@ -7,7 +7,7 @@ import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-/** Three retry queues (15 min, 30 min, 2 h by default); after the third retry fails: manual intervention. */
+/** Three retry queues (15 min, 1 h, 4 h by default); after the third retry fails: manual intervention. */
 @Component
 @RequiredArgsConstructor
 public class RetryPolicy {

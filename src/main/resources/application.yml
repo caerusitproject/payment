@@ -28,6 +28,7 @@ spring:
     consumer:
       group-id: payment-service
       auto-offset-reset: earliest
+      max-poll-records: 1
       enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -35,42 +36,33 @@ spring:
       ack-mode: record
 
 payment:
+  processor:
+    priority: NEW,RETRY_1,RETRY_2,RETRY_3
   default-currency: INR
   seed-reference-data: false
   topics:
     request: payment.request
-    retry1: payment.retry.1
-    retry2: payment.retry.2
-    retry3: payment.retry.3
-    pending: payment.pending
-    manual: payment.manual-intervention
-  processor:
-    poll-interval-ms: 5000
-    priority: NEW,RETRY_1,RETRY_2,RETRY_3
-  queue-dispatch:
-    poll-interval-ms: 5000
   retry:
-    delays: PT15M,PT30M,PT2H
+    delays: PT15M,PT1H,PT4H
     max-retries: 3
+    scheduler:
+      retry1-interval-ms: 900000
+      retry2-interval-ms: 3600000
+      retry3-interval-ms: 14400000
   pending:
     # Wait 15 minutes after a PENDING/ambiguous bank result before the next TransactionInquiry.
     inquiry-delay: PT15M
-    max-inquiries: 12
+    max-inquiries: 96
+    poll-interval-ms: 5000
   otp:
-    expiry: PT5M
+    expiry: PT2M
+    expiry-check-interval-ms: 120000
   txn-categories:
     "1024": SALARY_PAYMENT
     "1025": VENDOR_PAYMENT
     "1026": REIMBURSEMENT
     "1027": ADVANCE
     "1028": LOAN
-
-crypto:
-  # Local-only key for OTP worklist encryption. Account numbers are not encrypted in dev mode.
-  field-key: "ddNvcBraftG8RcR796TPg2qqIveRDaHAHTcoe7zT/8Q="
-  our-private-key: classpath:certs/dev/dummy-our-private-key.pem
-  our-certificate: classpath:certs/dev/dummy-our-certificate.pem
-  icici-public-certificate: classpath:certs/dev/dummy-bank-public-cert.pem
 
 icici:
   client: dummy
@@ -133,7 +125,7 @@ worklist:
   service:
     base-url: ${WORKLIST_SERVICE_URL:http://localhost:9090}
     task-create-path: /api/v1/worklist/tasks
-    task-by-id-path: /api/v1/worklist/tasks/{taskId}
+    task-by-code-path: /api/v1/worklist/tasks/{taskCode}
     task-status-path: /api/v1/worklist/tasks/{taskId}/status
     task-code: PAYMENT_OTP_AUTHORIZATION
     task-name: Authorize Payment Transaction

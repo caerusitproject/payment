@@ -1,4 +1,4 @@
--- SQL Server schema for payment-service. Use with the "sqlserver" profile (ddl-auto=validate).
+-- SQL Server schema for a new payment-service database. Hibernate ddl-auto=update is enabled.
 
 CREATE TABLE c3_payer (
     payer_id            BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -45,9 +45,11 @@ CREATE TABLE pymnt_req (
     retry_count         INT NOT NULL DEFAULT 0,
     next_attempt_at     DATETIME2(3) NULL,
     last_reason         VARCHAR(1000) NULL,
-    CONSTRAINT uk_pymnt_req_ref UNIQUE (req_ref_name, req_ref_id)
+    CONSTRAINT uk_pymnt_req_ref UNIQUE (req_ref_name, req_ref_id),
+    CONSTRAINT ck_pymnt_req_amount_positive CHECK (amount > 0),
+    CONSTRAINT ck_pymnt_req_retry_count CHECK (retry_count BETWEEN 0 AND 3)
 );
-CREATE INDEX ix_pymnt_req_pick ON pymnt_req (queue_type, proc_status, next_attempt_at);
+CREATE INDEX ix_pymnt_req_pick ON pymnt_req (queue_type, proc_status, next_attempt_at, pymnt_req_id);
 
 CREATE TABLE c3_benef_snapshot (
     beni_snap_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -65,7 +67,7 @@ CREATE TABLE c3_benef_snapshot (
 
 CREATE TABLE c3_pymnt_txn (
     pymnt_txn_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
-    pymnt_req_id        BIGINT NOT NULL REFERENCES pymnt_req(pymnt_req_id),
+    pymnt_req_id        BIGINT NOT NULL,
     payer_id            BIGINT NOT NULL REFERENCES c3_payer(payer_id),
     beneficiary_id      BIGINT NOT NULL,
     beni_snap_id        BIGINT NULL REFERENCES c3_benef_snapshot(beni_snap_id),
@@ -87,8 +89,15 @@ CREATE TABLE c3_pymnt_txn (
     wkl_task_id         BIGINT NULL,
     wkl_task_created_ts DATETIME2(3) NULL,
     otp_task_expires_ts DATETIME2(3) NULL,
-    CONSTRAINT uk_pymnt_txn_uid UNIQUE (unique_id)
+    manual_wkl_task_id  BIGINT NULL,
+    manual_wkl_task_created_ts DATETIME2(3) NULL,
+    CONSTRAINT uk_pymnt_txn_uid UNIQUE (unique_id),
+    CONSTRAINT uk_pymnt_txn_req_attempt UNIQUE (pymnt_req_id, attempt_num),
+    CONSTRAINT fk_pymnt_txn_req FOREIGN KEY (pymnt_req_id) REFERENCES pymnt_req(pymnt_req_id),
+    CONSTRAINT ck_pymnt_txn_amount_positive CHECK (amount > 0),
+    CONSTRAINT ck_pymnt_txn_attempt_positive CHECK (attempt_num > 0)
 );
+CREATE INDEX ix_pymnt_txn_req_latest ON c3_pymnt_txn (pymnt_req_id, pymnt_txn_id DESC);
 
 CREATE TABLE c3_bank_api_interaction (
     api_interaction_id  BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -100,25 +109,7 @@ CREATE TABLE c3_bank_api_interaction (
     initiated_ts        DATETIME2(3) NOT NULL,
     completed_ts        DATETIME2(3) NULL
 );
-CREATE INDEX ix_bank_api_uid ON c3_bank_api_interaction (unique_id, api_operation);
+CREATE INDEX ix_bank_api_uid ON c3_bank_api_interaction (unique_id, api_operation, initiated_ts);
 
--- Legacy local manual-intervention fallback only. OTP tasks are owned by the external Worklist Service.
-CREATE TABLE c3_pymnt_worklist_item (
-    id                  BIGINT IDENTITY(1,1) PRIMARY KEY,
-    item_type           VARCHAR(30) NOT NULL,
-    pymnt_req_id        BIGINT NOT NULL,
-    pymnt_txn_id        BIGINT NULL,
-    unique_id           VARCHAR(40) NULL,
-    title               VARCHAR(500) NOT NULL,
-    detail              VARCHAR(1000) NULL,
-    amount              DECIMAL(18,2) NULL,
-    status              VARCHAR(20) NOT NULL,
-    otp_encrypted       VARBINARY(MAX) NULL,
-    created_ts          DATETIME2(3) NOT NULL,
-    expires_ts          DATETIME2(3) NULL,
-    completed_ts        DATETIME2(3) NULL
-);
 
-CREATE UNIQUE INDEX ux_c3_pymnt_txn_wkl_task_id
-    ON c3_pymnt_txn(wkl_task_id)
-    WHERE wkl_task_id IS NOT NULL;
+CREATE INDEX ix_pymnt_txn_manual_wkl_task ON c3_pymnt_txn(manual_wkl_task_id);

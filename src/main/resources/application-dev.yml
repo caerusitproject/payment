@@ -1,15 +1,28 @@
-# Local-only profile. Retry timings and OTP expiry are accelerated; pending inquiry remains 15 minutes.
+# Local development profile. Bank calls are simulated; production credentials are never stored here.
 payment:
-  processor:
-    poll-interval-ms: 1000
-  retry:
-    delays: PT10S,PT20S,PT30S
   pending:
     # Keep the requested 15-minute inquiry interval in local development as well.
     inquiry-delay: PT15M
-  otp:
-    expiry: PT5M
   seed-reference-data: true
+  retry:
+    delays: PT15M,PT1H,PT4H
+  otp:
+    expiry: PT2M
+
+spring:
+  datasource:
+    url: jdbc:sqlserver://CITC-CCU-TC-D05;databaseName=C3;encrypt=true;trustServerCertificate=true
+    username: C3SvcAccount
+    password: Welcome@1234
+
+
+
+crypto:
+  # Local development key only. Replace through environment variables outside dev.
+  field-key: ${FIELD_ENCRYPTION_KEY:ddNvcBraftG8RcR796TPg2qqIveRDaHAHTcoe7zT/8Q=}
+  our-private-key: classpath:certs/dev/dummy-our-private-key.pem
+  our-certificate: classpath:certs/dev/dummy-our-certificate.pem
+  icici-public-certificate: classpath:certs/dev/dummy-bank-public-cert.pem
 
 icici:
   client: dummy

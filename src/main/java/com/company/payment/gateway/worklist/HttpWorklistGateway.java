@@ -16,35 +16,34 @@ public class HttpWorklistGateway implements WorklistGateway {
     @Value("${worklist.service.task-create-path:/api/v1/worklist/tasks}")
     private String createPath;
 
-    @Value("${worklist.service.task-by-id-path:/api/v1/worklist/tasks/{taskId}}")
-    private String getPath;
+    @Value("${worklist.service.task-by-code-path:/api/v1/worklist/tasks/{taskCode}}")
+    private String taskByCodePath;
 
     @Value("${worklist.service.task-status-path:/api/v1/worklist/tasks/{taskId}/status}")
     private String statusPath;
 
     @Override
     public WorklistTaskResponse createTask(WorklistTaskCreateRequest request) {
-        return worklistRestClient.post()
-                .uri(createPath)
-                .body(request)
-                .retrieve()
-                .body(WorklistTaskResponse.class);
+        return worklistRestClient.post().uri(createPath).body(request)
+                .retrieve().body(WorklistTaskResponse.class);
     }
 
+    /** Uses the Worklist API contract GET /tasks/{taskCode}?status=... */
     @Override
-    public WorklistTaskResponse getTask(Long taskId) {
-        return worklistRestClient.get()
-                .uri(getPath, taskId)
-                .retrieve()
-                .body(WorklistTaskResponse.class);
+    public void getTaskByCode(String taskCode, String status) {
+        worklistRestClient.get()
+                .uri(builder -> {
+                    var uri = builder.path(taskByCodePath.replace("{taskCode}", taskCode));
+                    if (status != null && !status.isBlank()) uri.queryParam("status", status);
+                    return uri.build();
+                })
+                .retrieve().toBodilessEntity();
     }
 
     @Override
     public void updateTaskStatus(Long taskId, String statusCode) {
-        worklistRestClient.put()
-                .uri(statusPath, taskId)
+        worklistRestClient.put().uri(statusPath, taskId)
                 .body(new WorklistTaskStatusUpdateRequest(statusCode))
-                .retrieve()
-                .toBodilessEntity();
+                .retrieve().toBodilessEntity();
     }
 }

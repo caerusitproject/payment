@@ -30,7 +30,7 @@ public interface PaymentRequestRepository extends JpaRepository<PaymentRequest, 
     /**
      * Claims one due pending inquiry by moving its due time forward before the bank call.
      *
-     * QueueDispatchScheduler may publish duplicate wake-up events (Kafka is at-least-once).
+     * Pending inquiry dispatch may publish duplicate wake-up events (Kafka is at-least-once).
      * This conditional update ensures that only one consumer can claim a particular due inquiry.
      * If the process crashes, the row becomes due again after the configured inquiry delay.
      *

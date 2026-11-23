@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 class RetryPolicyTest {
 
     private final RetryPolicy policy = new RetryPolicy(new PaymentProperties(null, null,
-            new PaymentProperties.Retry(List.of(Duration.ofMinutes(15), Duration.ofMinutes(30), Duration.ofHours(2)), 3),
+            new PaymentProperties.Retry(List.of(Duration.ofMinutes(15), Duration.ofHours(1), Duration.ofHours(4)), 3),
             null, null, "INR", false, null));
 
     @Test void firstFailureGoesToRetryQueue1After15Min() {
@@ -21,9 +21,9 @@ class RetryPolicyTest {
     }
 
     @Test void secondAndThirdQueues() {
-        assertEquals(Duration.ofMinutes(30), policy.next(1).orElseThrow().delay());
+        assertEquals(Duration.ofHours(1), policy.next(1).orElseThrow().delay());
         assertEquals(QueueType.RETRY_3, policy.next(2).orElseThrow().queue());
-        assertEquals(Duration.ofHours(2), policy.next(2).orElseThrow().delay());
+        assertEquals(Duration.ofHours(4), policy.next(2).orElseThrow().delay());
     }
 
     @Test void afterThirdRetryNothingLeft() {

@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 /** Stores a request taken from the main queue in pymnt_req. Idempotent on (req_ref_name, req_ref_id). */
 @Slf4j
@@ -22,6 +23,7 @@ public class PaymentIntakeService {
     private final PaymentProperties props;
 
     /** @return true if stored, false if this request was already received */
+    @Transactional
     public boolean store(PaymentRequestMessage m) {
         if (requests.existsByReqRefNameAndReqRefId(m.reqRefName(), m.reqRefId())) return false;
         if (m.paymentModeId() != null) {
@@ -29,7 +31,7 @@ public class PaymentIntakeService {
         }
         Instant now = Instant.now();
         try {
-            requests.save(PaymentRequest.builder()
+            requests.saveAndFlush(PaymentRequest.builder()
                     .reqRefName(m.reqRefName())
                     .reqRefId(m.reqRefId())
                     .benRefEntityName(m.benRefEntityName())
