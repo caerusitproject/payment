@@ -1,4 +1,17 @@
+
 package com.company.payment.bank;
 
-/** Balance inquiry request. Account number must be the registered ICICI account number. */
-public record BalanceInquiryRequest(String accountNo) {}
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+
+public record BalanceInquiryRequest(
+
+        @NotBlank(message = "Account number is required")
+        @Pattern(
+                regexp = "\\d{12}",
+                message = "Account number must contain exactly 12 digits"
+        )
+        String accountNo
+
+) {
+}

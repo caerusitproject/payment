@@ -61,18 +61,53 @@ public class DummyIciciClient implements IciciClient {
         return roundTrip(payloads.inquiry(r), () -> simulateInquiry(r.uniqueId()));
     }
 
+
     @Override
-    public BankResponse accountStatement(AccountStatementRequest request) {
-        return roundTrip(payloads.accountStatement(request),
-                () -> "{\"RESPONSE\":\"SUCCESS\",\"ACCOUNTNO\":\"" + request.accountNo()
-                        + "\",\"STATEMENT\":[]} ");
+    public BankResponse accountStatement(
+            AccountStatementRequest request) {
+
+        return roundTrip(
+                payloads.accountStatement(request),
+                () -> """
+                {
+                  "CORP_ID": "LOCAL-DUMMY-CORP",
+                  "USER_ID": "LOCAL-DUMMY-USER",
+                  "AGGR_ID": "LOCAL-DUMMY-AGGR",
+                  "URN": "LOCAL-DUMMY-URN",
+                  "ACCOUNTNO": "%s",
+                  "TXNDATE": "03-07-2015 12:00:00 AM",
+                  "REMARKS": "Salary",
+                  "AMOUNT": "0.00",
+                  "BALANCE": "48964.97",
+                  "VALUEDATE": "03-07-2015 12:00:00 AM",
+                  "TYPE": "CR",
+                  "TRANSACTIONID": "S26063006",
+                  "RESPONSE": "SUCCESS"
+                }
+                """.formatted(request.accountNo())
+        );
     }
 
     @Override
-    public BankResponse balanceInquiry(BalanceInquiryRequest request) {
-        return roundTrip(payloads.balanceInquiry(request),
-                () -> "{\"RESPONSE\":\"SUCCESS\",\"ACCOUNTNO\":\"" + request.accountNo()
-                        + "\",\"EFFECTIVEBAL\":0.00,\"CURRENCY\":\"INR\"}");
+    public BankResponse balanceInquiry(
+            BalanceInquiryRequest request) {
+
+        return roundTrip(
+                payloads.balanceInquiry(request),
+                () -> """
+                {
+                  "AGGR_ID": "LOCAL-DUMMY-AGGR",
+                  "CORP_ID": "LOCAL-DUMMY-CORP",
+                  "USER_ID": "LOCAL-DUMMY-USER",
+                  "URN": "LOCAL-DUMMY-URN",
+                  "ACCOUNTNO": "%s",
+                  "RESPONSE": "SUCCESS",
+                  "DATE": "25-11-2026",
+                  "EFFECTIVEBAL": 48964.970,
+                  "CURRENCY": "INR"
+                }
+                """.formatted(request.accountNo())
+        );
     }
 
     /** encrypt request for the bank -> (bank works) -> bank encrypts reply for us -> we decrypt. */
