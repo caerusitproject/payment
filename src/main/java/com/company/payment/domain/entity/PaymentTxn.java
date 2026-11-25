@@ -63,6 +63,9 @@ public class PaymentTxn {
     @Column(name = "urn", length = 50)
     private String urn;
 
+    @Column(name = "UTRNUMBER", length = 32)
+    private String utrNumber;
+
     @Enumerated(EnumType.STRING) @Column(name = "txn_status", nullable = false, length = 30)
     private TxnStatus txnStatus;
 

@@ -107,6 +107,9 @@ public class PaymentWorkflowService {
     @Value("${worklist.service.assignee-role-code:ACCOUNTS}")
     private String worklistAssigneeRoleCode;
 
+    @Value("${worklist.service.payment-transaction-entity-name:c3_pmnt_txn}")
+    private String paymentTransactionEntityName;
+
     // -------------------------------------------------------------------------
     // 1. SCHEDULER ENTRY POINT
     // -------------------------------------------------------------------------
@@ -810,15 +813,21 @@ public class PaymentWorkflowService {
         LocalDateTime taskCreatedAt = LocalDateTime.now(ZoneOffset.UTC);
         LocalDateTime taskExpiresAt = taskCreatedAt.plus(props.otp().expiry());
 
-        WorklistTaskCreateRequest taskRequest = WorklistTaskCreateRequest.builder()
-                .taskCode(worklistTaskCode)
-                .taskName(worklistTaskName)
-                .refEntityName(worklistRefEntityName)
-                .refEntityId(String.valueOf(req.getBenAcctId()))
-                .linkedInstEntityName(linkedInstanceEntityName)
-                .linkedInstEntityId(linkedInstanceEntityId)
-                .assigneeRoleCd(worklistAssigneeRoleCode)
-                .build();
+        WorklistTaskCreateRequest taskRequest =
+                WorklistTaskCreateRequest.builder()
+                        .taskCode(worklistTaskCode)
+                        .taskName(worklistTaskName)
+
+                        // Beneficiary reference from c3_pmnt_req
+                        .refEntityName(req.getReqRefName())
+                        .refEntityId(String.valueOf(req.getReqRefId()))
+
+                        // Actual payment transaction from c3_pmnt_txn
+                        .linkedInstEntityName(paymentTransactionEntityName)
+                        .linkedInstEntityId(txn.getPymntTxnId())
+
+                        .assigneeRoleCd(worklistAssigneeRoleCode)
+                        .build();
 
         WorklistTaskResponse taskResponse = worklistGateway.createTask(taskRequest);
         if (taskResponse == null || taskResponse.getWklTaskId() == null) {
@@ -1184,24 +1193,44 @@ public class PaymentWorkflowService {
         req.setLastReason(reason);
         save(req);
 
-        // Worklist owns the manual task. Payment Service stores only the external task ID.
-        PaymentTxn latest = txns.findFirstByPymntReqIdOrderByPymntTxnIdDesc(req.getPymntReqId()).orElse(null);
-        WorklistTaskResponse task = worklistGateway.createTask(WorklistTaskCreateRequest.builder()
-                .taskCode("MANUAL_INTERVENTION_ON_PAYMENT")
-                .taskName("Manual intervention on payment")
-                .refEntityName("PAYMENT_REQUEST")
-                .refEntityId(String.valueOf(req.getPymntReqId()))
-                .linkedInstEntityName("PAYMENT")
-                .linkedInstEntityId(req.getPymntReqId())
-                .assigneeRoleCd("ACCOUNTS")
-                .build());
-        if (latest != null && task != null) {
+        // Get the latest payment transaction from c3_pymnt_txn
+        PaymentTxn latest = txns
+                .findFirstByPymntReqIdOrderByPymntTxnIdDesc(req.getPymntReqId())
+                .orElse(null);
+
+        if (latest == null) {
+            log.error("No payment transaction found for paymentRequestId={}",
+                    req.getPymntReqId());
+            return;
+        }
+
+        WorklistTaskResponse task = worklistGateway.createTask(
+                WorklistTaskCreateRequest.builder()
+                        .taskCode("MANUAL_INTERVENTION_ON_PAYMENT")
+                        .taskName("Manual intervention on payment")
+
+                        // Reference entity: beneficiary reference from c3_pmnt_req
+                        .refEntityName(req.getReqRefName())
+                        .refEntityId(String.valueOf(req.getReqRefId()))
+
+                        // Linked instance: actual payment transaction
+                        .linkedInstEntityName(paymentTransactionEntityName)
+                        .linkedInstEntityId(latest.getPymntTxnId())
+
+                        .assigneeRoleCd("ACCOUNTS")
+                        .build()
+        );
+
+        if (task != null && task.getWklTaskId() != null) {
             latest.setManualWklTaskId(task.getWklTaskId());
             latest.setManualWklTaskCreatedTs(task.getCreatedTs());
             txns.save(latest);
         }
+
         resumeListenerAndStartQueuedNew();
-        log.warn("{}:{} -> MANUAL_INTERVENTION: {}", req.getReqRefName(), req.getReqRefId(), reason);
+
+        log.warn("{}:{} -> MANUAL_INTERVENTION: {}",
+                req.getReqRefName(), req.getReqRefId(), reason);
     }
 
     // -------------------------------------------------------------------------
@@ -1305,22 +1334,48 @@ public class PaymentWorkflowService {
     private void recordResponse(PaymentTxn txn, String body, TxnStatus status) {
         String response = BankJson.field(body, "response");
         String respCode = BankJson.field(body, "responsecode");
-        if (response != null && response.matches("\\d+")) {       // e.g. {"response":8012} is a code, not a status word
+
+        if (response != null && response.matches("\\d+")) {
             respCode = response;
             response = "FAILURE";
         }
-        txn.setResponse(response == null || response.isBlank() ? "UNKNOWN" : response.toUpperCase());
+
+        txn.setResponse(
+                response == null || response.isBlank()
+                        ? "UNKNOWN"
+                        : response.toUpperCase()
+        );
+
         txn.setRespCode(respCode);
         txn.setErrorCode(BankJson.field(body, "errorcode"));
+
+        // Store ICICI URN for the transaction
+        String urn = BankJson.field(body, "urn");
+        if (urn != null && !urn.isBlank()) {
+            txn.setUrn(urn);
+        }
+
         if (status == TxnStatus.SUCCESS) {
-            String urn = BankJson.field(body, "urn");
-            if (urn == null) urn = BankJson.field(body, "utrnumber");
-            if (urn != null) txn.setUrn(urn);
+            // Store ICICI UTRNUMBER only on success
+            String utrNumber = BankJson.field(body, "utrnumber");
+
+            if (utrNumber != null && !utrNumber.isBlank()) {
+                txn.setUtrNumber(utrNumber);
+            }
+
             txn.setFailureMessage(null);
         } else {
             String message = BankJson.field(body, "message");
-            txn.setFailureMessage(truncate(message != null ? message : (body == null ? "No response from bank" : null), 1000));
+            txn.setFailureMessage(
+                    truncate(
+                            message != null
+                                    ? message
+                                    : (body == null ? "No response from bank" : null),
+                            1000
+                    )
+            );
         }
+
         txn.setTxnStatus(status);
         touch(txn);
     }
