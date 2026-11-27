@@ -53,7 +53,7 @@ payment:
     # Wait 15 minutes after a PENDING/ambiguous bank result before the next TransactionInquiry.
     inquiry-delay: PT15M
     max-inquiries: 96
-    poll-interval-ms: 5000
+    poll-interval-ms: 900000
   otp:
     expiry: PT2M
     expiry-check-interval-ms: 120000

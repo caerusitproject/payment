@@ -79,6 +79,7 @@ CREATE TABLE c3_pymnt_txn (
     transaction_type    VARCHAR(3) NOT NULL,
     unique_id           VARCHAR(40) NOT NULL,
     urn                 VARCHAR(50) NULL,
+    utrNumber                 VARCHAR(50) NULL,
     txn_status          VARCHAR(30) NOT NULL,
     response            VARCHAR(30) NOT NULL,
     resp_code           VARCHAR(30) NULL,

@@ -5,6 +5,9 @@ import com.company.payment.domain.enums.ProcStatus;
 import com.company.payment.domain.enums.QueueType;
 import com.company.payment.domain.repository.PaymentRequestRepository;
 import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -18,21 +21,34 @@ import org.springframework.stereotype.Component;
 @Component
 @RequiredArgsConstructor
 public class PendingInquiryScheduler {
+
     private final PaymentRequestRepository requests;
     private final PaymentWorkflowService workflow;
 
-    @Scheduled(fixedDelayString = "${payment.pending.poll-interval-ms:5000}")
+    @Scheduled(fixedDelayString = "${payment.pending.poll-interval-ms:900000}")
     public void pollDueInquiries() {
-        requests.findFirstByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
-                QueueType.PENDING, ProcStatus.PENDING, Instant.now())
-            .ifPresent(this::processOne);
+
+        List<PaymentRequest> eligiblePayments =
+                requests.findAllByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
+                        QueueType.PENDING,
+                        ProcStatus.PENDING,
+                        Instant.now()
+                );
+
+        for (PaymentRequest request : eligiblePayments) {
+            processOne(request);
+        }
     }
 
     private void processOne(PaymentRequest request) {
         try {
             workflow.processPendingEvent(request.getPymntReqId());
         } catch (Exception ex) {
-            log.error("Pending inquiry failed for paymentRequestId={}", request.getPymntReqId(), ex);
+            log.error(
+                    "Pending inquiry failed for paymentRequestId={}",
+                    request.getPymntReqId(),
+                    ex
+            );
         }
     }
 }

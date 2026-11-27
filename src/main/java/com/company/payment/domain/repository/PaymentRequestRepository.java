@@ -57,4 +57,10 @@ public interface PaymentRequestRepository extends JpaRepository<PaymentRequest, 
 
     @Query("select p.queueType, p.procStatus, count(p) from PaymentRequest p group by p.queueType, p.procStatus")
     List<Object[]> countByQueueAndStatus();
+
+    List<PaymentRequest> findAllByQueueTypeAndProcStatusAndNextAttemptAtLessThanEqualOrderByNextAttemptAtAscPymntReqIdAsc(
+            QueueType queueType,
+            ProcStatus procStatus,
+            Instant currentTime
+    );
 }
